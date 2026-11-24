@@ -1,4 +1,6 @@
-export type PromoteSubjectType = "component" | "flow" | "claim" | "edge";
+import type { MembershipSubjectType } from "./schema.js";
+
+export type PromoteSubjectType = MembershipSubjectType;
 
 export interface PromoteSubjectRef {
   type: PromoteSubjectType;
@@ -9,6 +11,7 @@ export interface PromotedCounts {
   components: number;
   flows: number;
   claims: number;
+  sources: number;
   edges: number;
 }
 
@@ -27,11 +30,12 @@ export interface PromoteReport {
  * counting stays unit-testable independently of the SQLite move it summarizes.
  */
 export function countPromotedSubjects(refs: readonly PromoteSubjectRef[]): PromotedCounts {
-  const counts: PromotedCounts = { components: 0, flows: 0, claims: 0, edges: 0 };
+  const counts: PromotedCounts = { components: 0, flows: 0, claims: 0, sources: 0, edges: 0 };
   for (const ref of refs) {
     if (ref.type === "component") counts.components += 1;
     else if (ref.type === "flow") counts.flows += 1;
     else if (ref.type === "claim") counts.claims += 1;
+    else if (ref.type === "source") counts.sources += 1;
     else counts.edges += 1;
   }
   return counts;

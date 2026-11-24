@@ -65,12 +65,12 @@ try {
 
   // --- promote: every working membership moves into main under one commit ---
   const report = service.promoteWorking(repo);
-  assert.deepEqual(report.promoted, { components: 1, flows: 0, claims: 1, edges: 1 }, "promoted counts");
+  assert.deepEqual(report.promoted, { components: 1, flows: 0, claims: 1, sources: 0, edges: 1 }, "promoted counts");
   assert.equal(report.total, 3, "promoted total");
   assert.ok(report.memory_commit_id, "a main memory commit owns the promoted subjects");
 
   // --- after promote: working is empty, main owns everything, and NOTHING was
-  //     deleted (object rows are global) ---
+  //     deleted (object rows stay in place) ---
   assert.equal(membershipCount(initialized.working_scope_id), 0, "working scope cleared");
   assert.equal(membershipCount(initialized.main_scope_id), 5, "main now owns all 5 subjects");
   for (const [type, id] of [
@@ -92,7 +92,7 @@ try {
 
   // --- idempotent: a second promote finds nothing in working ---
   const again = service.promoteWorking(repo);
-  assert.deepEqual(again.promoted, { components: 0, flows: 0, claims: 0, edges: 0 }, "second promote is a no-op");
+  assert.deepEqual(again.promoted, { components: 0, flows: 0, claims: 0, sources: 0, edges: 0 }, "second promote is a no-op");
   assert.equal(again.total, 0, "second promote total is zero");
   assert.equal(again.memory_commit_id, undefined, "no commit created when working is empty");
 
@@ -102,9 +102,10 @@ try {
       { type: "component", id: "c1" },
       { type: "claim", id: "k1" },
       { type: "claim", id: "k2" },
+      { type: "source", id: "s1" },
       { type: "edge", id: "e1" },
     ]),
-    { components: 1, flows: 0, claims: 2, edges: 1 },
+    { components: 1, flows: 0, claims: 2, sources: 1, edges: 1 },
     "countPromotedSubjects tallies by type",
   );
 } finally {
