@@ -3,17 +3,36 @@ import { createHash, randomUUID } from "node:crypto";
 import type { MemoryCommit } from "../../knowledge-graph/commit.js";
 import type { Edge } from "../../knowledge-graph/edge.js";
 import type { MemoryCommitProposal } from "../../knowledge-graph/proposal.js";
-import type { Component, Flow, GraphObjectType, Source } from "../../knowledge-graph/schema.js";
+import type { Component, Flow, GraphObjectType, MembershipSubjectType, Source } from "../../knowledge-graph/schema.js";
 import type { Claim } from "../../knowledge-graph/claim.js";
 import type { GraphScope, GraphScopeKind } from "../../knowledge-graph/scope.js";
 import type { GcSubjectRef } from "../../knowledge-graph/graph-gc.js";
+import { installCommandSuggestion } from "../../install/paths.js";
+import { canonicalRepoKey, canonicalRepoPath } from "../../install/repo-identity.js";
+import type { ClaimProvenanceRecord, GraphReadRepository } from "../../knowledge-graph/repository.js";
+
+export type RepoStatus = "active" | "inactive";
+export type RepoMode = "local" | "managed";
+export type ManagedRepoRole = "reader" | "contributor" | "memory_admin";
+export type ManagedAccessStatus = "active" | "pending" | "suspended" | "revoked";
 
 export interface RepoRecord {
   id: string;
+  repo_key: string;
   remote_url: string | null;
   root_path: string | null;
   repo_name: string;
   default_branch: string;
+  status: RepoStatus;
+  active_mode: RepoMode;
+  managed_repo_id: string | null;
+  managed_role: ManagedRepoRole | null;
+  managed_access_status: ManagedAccessStatus | null;
+  managed_access_refreshed_at: string | null;
+  hooks_enabled: 0 | 1;
+  auto_memory_updates: 0 | 1;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface UpsertRepoInput {
@@ -39,7 +58,7 @@ export interface CreateMemoryCommitInput {
 }
 
 type MembershipRow = {
-  subject_type: "component" | "flow" | "claim" | "edge";
+  subject_type: MembershipSubjectType;
   subject_id: string;
 };
 
@@ -73,31 +92,50 @@ export interface InsertGraphObjectEmbeddingInput {
   embedding: Buffer;
 }
 
-export interface ClaimProvenanceRecord {
-  claim_id: string;
-  created_at: string;
-  memory_commit_id: string;
-}
+export type { ClaimProvenanceRecord } from "../../knowledge-graph/repository.js";
 
-export class SqliteRepository {
+export class SqliteRepository implements GraphReadRepository {
   constructor(private readonly db: Database.Database) {}
+
+  close(): void {
+    this.db.close();
+  }
 
   upsertRepo(input: UpsertRepoInput): { repo: RepoRecord; created: boolean } {
     const existing = this.findRepo(input);
     if (existing) return { repo: this.updateRepo(existing.repo, input, existing.matchedBy), created: false };
 
+    const timestamp = now();
     const repo: RepoRecord = {
-      id: makeId("repo", identityKey(input)),
+      id: makeId("repo", canonicalRepoKey(input)),
+      repo_key: canonicalRepoKey(input),
       remote_url: input.remote_url ?? null,
-      root_path: input.repo_root ?? null,
+      root_path: input.repo_root === undefined ? null : canonicalRepoPath(input.repo_root),
       repo_name: input.repo_name,
       default_branch: input.default_branch,
+      status: "inactive",
+      active_mode: "local",
+      managed_repo_id: null,
+      managed_role: null,
+      managed_access_status: null,
+      managed_access_refreshed_at: null,
+      hooks_enabled: 1,
+      auto_memory_updates: 1,
+      created_at: timestamp,
+      updated_at: timestamp,
     };
 
     this.db
       .prepare(
-        `INSERT INTO repos (id, remote_url, root_path, repo_name, default_branch)
-         VALUES (@id, @remote_url, @root_path, @repo_name, @default_branch)`,
+        `INSERT INTO repos (
+           id, repo_key, remote_url, root_path, repo_name, default_branch,
+           status, active_mode, managed_repo_id, managed_role, managed_access_status,
+           managed_access_refreshed_at, hooks_enabled, auto_memory_updates, created_at, updated_at
+         ) VALUES (
+           @id, @repo_key, @remote_url, @root_path, @repo_name, @default_branch,
+           @status, @active_mode, @managed_repo_id, @managed_role, @managed_access_status,
+           @managed_access_refreshed_at, @hooks_enabled, @auto_memory_updates, @created_at, @updated_at
+         )`,
       )
       .run(repo);
 
@@ -106,6 +144,10 @@ export class SqliteRepository {
 
   getRepoByRemote(remoteUrl: string): RepoRecord | undefined {
     return this.db.prepare("SELECT * FROM repos WHERE remote_url = ?").get(remoteUrl) as RepoRecord | undefined;
+  }
+
+  getRepoByKey(repoKey: string): RepoRecord | undefined {
+    return this.db.prepare("SELECT * FROM repos WHERE repo_key = ?").get(repoKey) as RepoRecord | undefined;
   }
 
   getRepoByRootPath(rootPath: string): RepoRecord | undefined {
@@ -119,12 +161,14 @@ export class SqliteRepository {
   requireRepo(input: UpsertRepoInput): RepoRecord {
     const repo = this.getRepo(input);
     if (!repo) {
-      throw new Error("Greplica is not installed for this repo. Run greplica install --platform <codex|claude|copilot|opencode> --embedding local from the repo you want to use.");
+      throw new Error(`Greplica is not installed for this repo. Run ${installCommandSuggestion} from the repo you want to use.`);
     }
     return repo;
   }
 
   private findRepo(input: UpsertRepoInput): RepoMatch | undefined {
+    const byKey = this.getRepoByKey(canonicalRepoKey(input));
+    if (byKey !== undefined) return { repo: byKey, matchedBy: input.remote_url === undefined ? "root" : "remote" };
     if (input.remote_url !== undefined) {
       const byRemote = this.getRepoByRemote(input.remote_url);
       if (byRemote !== undefined) return { repo: byRemote, matchedBy: "remote" };
@@ -143,19 +187,36 @@ export class SqliteRepository {
       matchedBy === "root" || existing.root_path === null || existing.root_path === input.repo_root;
     const repo: RepoRecord = {
       id: existing.id,
+      repo_key: matchedBy === "root" && input.remote_url !== undefined
+        ? canonicalRepoKey(input)
+        : existing.repo_key,
       remote_url: input.remote_url ?? existing.remote_url,
-      root_path: shouldUpdateRootPath ? (input.repo_root ?? existing.root_path) : existing.root_path,
+      root_path: shouldUpdateRootPath
+        ? (input.repo_root === undefined ? existing.root_path : canonicalRepoPath(input.repo_root))
+        : existing.root_path,
       repo_name: input.repo_name,
       default_branch: input.default_branch,
+      status: existing.status,
+      active_mode: existing.active_mode,
+      managed_repo_id: existing.managed_repo_id,
+      managed_role: existing.managed_role,
+      managed_access_status: existing.managed_access_status,
+      managed_access_refreshed_at: existing.managed_access_refreshed_at,
+      hooks_enabled: existing.hooks_enabled,
+      auto_memory_updates: existing.auto_memory_updates,
+      created_at: existing.created_at,
+      updated_at: now(),
     };
 
     this.db
       .prepare(
         `UPDATE repos
-         SET remote_url = @remote_url,
+         SET repo_key = @repo_key,
+             remote_url = @remote_url,
              root_path = @root_path,
              repo_name = @repo_name,
-             default_branch = @default_branch
+             default_branch = @default_branch,
+             updated_at = @updated_at
          WHERE id = @id`,
       )
       .run(repo);
@@ -193,7 +254,7 @@ export class SqliteRepository {
     const scope = this.db
       .prepare("SELECT * FROM graph_scopes WHERE repo_id = ? AND kind = 'working' AND name = 'working'")
       .get(repoId) as GraphScope | undefined;
-    if (!scope) throw new Error("Working scope is missing. Run 'greplica install --platform <codex|claude|copilot|opencode> --embedding local' from this repo.");
+    if (!scope) throw new Error(`Working scope is missing. Run '${installCommandSuggestion}' from this repo.`);
     return scope;
   }
 
@@ -201,7 +262,7 @@ export class SqliteRepository {
     const scope = this.db
       .prepare("SELECT * FROM graph_scopes WHERE repo_id = ? AND kind = 'main' ORDER BY created_at LIMIT 1")
       .get(repoId) as GraphScope | undefined;
-    if (!scope) throw new Error("Main scope is missing. Run 'greplica install --platform <codex|claude|copilot|opencode> --embedding local' from this repo.");
+    if (!scope) throw new Error(`Main scope is missing. Run '${installCommandSuggestion}' from this repo.`);
     return scope;
   }
 
@@ -232,6 +293,26 @@ export class SqliteRepository {
       .all(repoId) as ClaimProvenanceRecord[];
   }
 
+  readEdges(repoId: string): Edge[] {
+    const rows = this.db.prepare("SELECT * FROM edges WHERE repo_id = ?").all(repoId) as EdgeRow[];
+    return deserializeEdges(rows);
+  }
+
+  // Baseline anchor fingerprints stored when each claim was written, keyed by
+  // claim id then by anchor key. Used by the anchor audit to detect drift.
+  readClaimAnchorFingerprints(repoId: string, ids: string[]): Map<string, Record<string, string>> {
+    const fingerprints = new Map<string, Record<string, string>>();
+    if (ids.length === 0) return fingerprints;
+    const rows = this.db
+      .prepare(`SELECT id, anchor_fingerprints FROM claims WHERE repo_id = ? AND id IN (${placeholders(ids)})`)
+      .all(repoId, ...ids) as Array<{ id: string; anchor_fingerprints: string | null }>;
+    for (const row of rows) {
+      if (row.anchor_fingerprints === null) continue;
+      fingerprints.set(row.id, JSON.parse(row.anchor_fingerprints) as Record<string, string>);
+    }
+    return fingerprints;
+  }
+
   readGraphView(repoId: string): {
     components: Component[];
     flows: Flow[];
@@ -248,14 +329,14 @@ export class SqliteRepository {
       (edge) =>
         active.has(subjectKey("edge", edge.id)) &&
         active.has(subjectKey(edge.from_type, edge.from_id)) &&
-        (edge.to_type === "source" || active.has(subjectKey(edge.to_type, edge.to_id))),
+        active.has(subjectKey(edge.to_type, edge.to_id)),
     );
 
     return {
       components: this.loadComponents(repoId, selectActiveIds(memberships, active, "component")),
       flows: this.loadFlows(repoId, selectActiveIds(memberships, active, "flow")),
       claims: this.loadClaims(repoId, selectActiveIds(memberships, active, "claim")),
-      sources: this.loadSources(repoId, [...new Set(edges.filter((edge) => edge.to_type === "source").map((edge) => edge.to_id))]),
+      sources: this.loadSources(repoId, selectActiveIds(memberships, active, "source")),
       edges,
     };
   }
@@ -274,7 +355,7 @@ export class SqliteRepository {
   } {
     const scopeIds = this.currentScopeIds(repoId);
     const memberships = this.membershipsForScopes(scopeIds);
-    const edges = this.loadEdges(selectIds(memberships, "edge"));
+    const edges = this.loadEdges(repoId, selectIds(memberships, "edge"));
     const active = activeSubjectKeys(memberships, edges);
 
     const existingKeys = new Set<string>();
@@ -283,24 +364,23 @@ export class SqliteRepository {
         { type: edge.from_type, id: edge.from_id },
         { type: edge.to_type, id: edge.to_id },
       ]) {
-        if (this.subjectExists(endpoint.type, endpoint.id)) existingKeys.add(subjectKey(endpoint.type, endpoint.id));
+        if (this.subjectExists(repoId, endpoint.type, endpoint.id)) existingKeys.add(subjectKey(endpoint.type, endpoint.id));
       }
     }
 
     return {
-      components: this.loadComponents(selectActiveIds(memberships, active, "component")),
-      flows: this.loadFlows(selectActiveIds(memberships, active, "flow")),
-      claims: this.loadClaims(selectActiveIds(memberships, active, "claim")),
+      components: this.loadComponents(repoId, selectActiveIds(memberships, active, "component")),
+      flows: this.loadFlows(repoId, selectActiveIds(memberships, active, "flow")),
+      claims: this.loadClaims(repoId, selectActiveIds(memberships, active, "claim")),
       edges,
       existingKeys,
     };
   }
 
   /**
-   * Prune a `graph gc` plan for one repo in a single transaction. Object rows
-   * are global across repos (issue #103), so we only unlink this repo's
-   * memberships and repo-scoped embeddings, then delete the shared row when no
-   * membership anywhere still references it.
+   * Prune a `graph gc` plan for one repo in a single transaction: unlink the
+   * repo's current memberships and embeddings, then delete the repo's object
+   * row once no scope of this repo still references it.
    */
   applyGc(repoId: string, plan: { subjects: GcSubjectRef[]; edges: string[] }): void {
     const scopeIds = this.currentScopeIds(repoId);
@@ -315,20 +395,21 @@ export class SqliteRepository {
       "DELETE FROM graph_object_embeddings WHERE repo_id = ? AND object_type = ? AND object_id = ?",
     );
     const membershipRemains = this.db.prepare(
-      "SELECT 1 FROM graph_memberships WHERE subject_type = ? AND subject_id = ? LIMIT 1",
+      `SELECT 1 FROM graph_memberships gm JOIN graph_scopes gs ON gs.id = gm.scope_id
+       WHERE gs.repo_id = ? AND gm.subject_type = ? AND gm.subject_id = ? LIMIT 1`,
     );
     const deleteRow: Record<GcSubjectRef["type"], Database.Statement> = {
-      component: this.db.prepare("DELETE FROM components WHERE id = ?"),
-      flow: this.db.prepare("DELETE FROM flows WHERE id = ?"),
-      claim: this.db.prepare("DELETE FROM claims WHERE id = ?"),
-      edge: this.db.prepare("DELETE FROM edges WHERE id = ?"),
+      component: this.db.prepare("DELETE FROM components WHERE repo_id = ? AND id = ?"),
+      flow: this.db.prepare("DELETE FROM flows WHERE repo_id = ? AND id = ?"),
+      claim: this.db.prepare("DELETE FROM claims WHERE repo_id = ? AND id = ?"),
+      edge: this.db.prepare("DELETE FROM edges WHERE repo_id = ? AND id = ?"),
     };
 
     const write = this.db.transaction((items: GcSubjectRef[]) => {
       for (const ref of items) {
         deleteMembership.run(...scopeIds, ref.type, ref.id);
         if (ref.type !== "edge") deleteEmbedding.run(repoId, ref.type, ref.id);
-        if (membershipRemains.get(ref.type, ref.id) === undefined) deleteRow[ref.type].run(ref.id);
+        if (membershipRemains.get(repoId, ref.type, ref.id) === undefined) deleteRow[ref.type].run(repoId, ref.id);
       }
     });
     write(refs);
@@ -361,7 +442,12 @@ export class SqliteRepository {
     return memoryCommit;
   }
 
-  createProposalRecords(scopeId: string, memoryCommitId: string, proposal: MemoryCommitProposal): void {
+  createProposalRecords(
+    scopeId: string,
+    memoryCommitId: string,
+    proposal: MemoryCommitProposal,
+    anchorFingerprints?: Map<string, Record<string, string>>,
+  ): void {
     const write = this.db.transaction(() => {
       const repoId = this.repoIdForScope(scopeId);
 
@@ -380,15 +466,18 @@ export class SqliteRepository {
       }
 
       for (const claim of proposal.creates.claims ?? []) {
+        const fingerprints = anchorFingerprints?.get(claim.id);
         this.db
           .prepare(
-            `INSERT INTO claims (repo_id, id, kind, text, truth, intent, code_anchors)
-             VALUES (@repo_id, @id, @kind, @text, @truth, @intent, @code_anchors)`,
+            `INSERT INTO claims (repo_id, id, kind, text, truth, intent, code_anchors, anchor_fingerprints)
+             VALUES (@repo_id, @id, @kind, @text, @truth, @intent, @code_anchors, @anchor_fingerprints)`,
           )
           .run({
             repo_id: repoId,
             ...claim,
             code_anchors: claim.code_anchors === undefined ? null : JSON.stringify(claim.code_anchors),
+            anchor_fingerprints:
+              fingerprints === undefined || Object.keys(fingerprints).length === 0 ? null : JSON.stringify(fingerprints),
           });
         this.createMembership(scopeId, "claim", claim.id, memoryCommitId);
       }
@@ -397,6 +486,7 @@ export class SqliteRepository {
         this.db
           .prepare("INSERT INTO sources (repo_id, id, kind, ref, title) VALUES (@repo_id, @id, @kind, @ref, @title)")
           .run({ repo_id: repoId, ...source, title: source.title ?? null });
+        this.createMembership(scopeId, "source", source.id, memoryCommitId);
       }
 
       for (const edge of proposal.creates.edges ?? []) {
@@ -460,7 +550,7 @@ export class SqliteRepository {
 
   private createMembership(
     scopeId: string,
-    subjectType: "component" | "flow" | "claim" | "edge",
+    subjectType: MembershipSubjectType,
     subjectId: string,
     memoryCommitId: string,
   ): void {
@@ -534,10 +624,7 @@ export class SqliteRepository {
     const rows = this.db
       .prepare(`SELECT * FROM edges WHERE repo_id = ? AND id IN (${placeholders(ids)})`)
       .all(repoId, ...ids) as EdgeRow[];
-    return rows.map(({ repo_id: _repoId, metadata, ...row }) => ({
-      ...row,
-      metadata: metadata === null ? undefined : (JSON.parse(metadata) as Record<string, unknown>),
-    }));
+    return deserializeEdges(rows);
   }
 
   private loadByIds<T>(repoId: string, table: string, ids: string[]): T[] {
@@ -559,6 +646,13 @@ function activeSubjectKeys(memberships: MembershipRow[], edges: Edge[]): Set<str
   }
 
   return active;
+}
+
+function deserializeEdges(rows: EdgeRow[]): Edge[] {
+  return rows.map(({ repo_id: _repoId, metadata, ...row }) => ({
+    ...row,
+    metadata: metadata === null ? undefined : (JSON.parse(metadata) as Record<string, unknown>),
+  }));
 }
 
 function selectIds(memberships: MembershipRow[], type: MembershipRow["subject_type"]): string[] {
@@ -593,16 +687,11 @@ function makeId(prefix: string, value: string): string {
   return `${prefix}_${hash}`;
 }
 
-function identityKey(input: UpsertRepoInput): string {
-  if (input.remote_url !== undefined) return input.remote_url;
-  if (input.repo_root !== undefined) return `root:${input.repo_root}`;
-  throw new Error("Repo memory needs either a remote URL or a root path.");
-}
-
 function rootPathCandidates(rootPath: string): string[] {
-  const candidates = [rootPath];
-  if (rootPath.startsWith("/private/var/")) candidates.push(rootPath.slice("/private".length));
-  if (rootPath.startsWith("/var/")) candidates.push(`/private${rootPath}`);
+  const canonical = canonicalRepoPath(rootPath);
+  const candidates = [canonical];
+  if (canonical.startsWith("/private/var/")) candidates.push(canonical.slice("/private".length));
+  if (canonical.startsWith("/var/")) candidates.push(`/private${canonical}`);
   return candidates;
 }
 

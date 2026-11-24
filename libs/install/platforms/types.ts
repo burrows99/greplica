@@ -1,5 +1,5 @@
 import type { InstallPlatform } from "../paths.js";
-import type { HookInput } from "../../hooks/hook-input.js";
+import type { HookInput } from "../../hooks/types.js";
 
 export interface PlatformInstallContext {
   repoRoot: string;
@@ -13,9 +13,16 @@ export interface HookInstallResult {
   command: string;
 }
 
+export interface RuleInstallResult {
+  platform: InstallPlatform;
+  configFiles: string[];
+}
+
 export interface PlatformInstallResult {
   skills: string[];
   hooks?: HookInstallResult;
+  rules?: RuleInstallResult;
+  supportsAutoMemoryUpdates?: boolean;
 }
 
 export interface WorkingMemoryUpdateInput {

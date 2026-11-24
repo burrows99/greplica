@@ -67,14 +67,14 @@ try {
   assert.deepEqual(graph.components.map((c) => c.id), ["component.keep"], "only healthy component remains");
   assert.deepEqual(graph.claims.map((c) => c.id), ["claim.keep"], "only healthy claim remains");
 
-  assert.equal(repository.subjectExists("claim", "claim.drop"), false, "stale claim row deleted");
-  assert.equal(repository.subjectExists("component", "component.drop"), false, "stale component row deleted");
-  assert.equal(repository.subjectExists("edge", "edge.about_drop"), false, "cascaded edge deleted");
-  assert.equal(repository.subjectExists("edge", "edge.dangling"), false, "dangling edge deleted");
+  assert.equal(repository.subjectExists(initialized.repo_id, "claim", "claim.drop"), false, "stale claim row deleted");
+  assert.equal(repository.subjectExists(initialized.repo_id, "component", "component.drop"), false, "stale component row deleted");
+  assert.equal(repository.subjectExists(initialized.repo_id, "edge", "edge.about_drop"), false, "cascaded edge deleted");
+  assert.equal(repository.subjectExists(initialized.repo_id, "edge", "edge.dangling"), false, "dangling edge deleted");
 
-  assert.equal(repository.subjectExists("claim", "claim.keep"), true, "healthy claim kept");
-  assert.equal(repository.subjectExists("component", "component.keep"), true, "healthy component kept");
-  assert.equal(repository.subjectExists("edge", "edge.about_keep"), true, "healthy edge kept");
+  assert.equal(repository.subjectExists(initialized.repo_id, "claim", "claim.keep"), true, "healthy claim kept");
+  assert.equal(repository.subjectExists(initialized.repo_id, "component", "component.keep"), true, "healthy component kept");
+  assert.equal(repository.subjectExists(initialized.repo_id, "edge", "edge.about_keep"), true, "healthy edge kept");
 
   // --- idempotent: nothing left to prune ---
   const again = await service.gcGraph(repo, { dryRun: true });
